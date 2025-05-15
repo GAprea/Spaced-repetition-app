@@ -1,3 +1,4 @@
+import os
 import sys
 import io
 import json
@@ -5,6 +6,7 @@ import csv
 import ssl
 import tempfile
 import shutil
+import logging
 from pathlib import Path
 from functools import partial
 from datetime import datetime, timedelta
@@ -21,6 +23,8 @@ from google.oauth2 import service_account
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
+from dotenv import load_dotenv
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTableWidget, QTableWidgetItem,
     QPushButton, QFileDialog, QInputDialog, QMessageBox,
@@ -35,26 +39,17 @@ from PyQt6.QtCore import (
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────
-# Path to your Google service account JSON file (must be created in GCP & shared
-# with the target Drive folder).
-SERVICE_ACCOUNT_FILE = Path("path/to/your-service-account.json")
+# ─── LOAD ENV VARIABLES ────────────────────────────────────────────────────
+load_dotenv()  # loads variables from .env into os.environ
 
-# Path to your OAuth 2.0 client secrets JSON file (for user consent).
-# You must download this from the Google Cloud Console and name it (or update
-# the constant below).
-OAUTH_CREDENTIALS_FILE = Path("path/to/your-oauth-credentials.json")
+SERVICE_ACCOUNT_FILE   = Path(os.getenv("SERVICE_ACCOUNT_FILE"))
+OAUTH_CREDENTIALS_FILE = Path(os.getenv("OAUTH_CREDENTIALS_FILE"))
+SHARED_ROOT_FOLDER_ID  = os.getenv("SHARED_ROOT_FOLDER_ID")
+USER_EMAIL             = os.getenv("USER_EMAIL")
 
-# Google Drive folder ID where all topic subfolders will live.
-SHARED_ROOT_FOLDER_ID = "<YOUR_SHARED_ROOT_FOLDER_ID>"
-
-# Your personal email address (also your default Calendar ID).
-USER_EMAIL = "<YOUR_EMAIL_ADDRESS>"
-
-# Filenames for the on-Drive CSV logs. You can change these names if you like,
-# but keep the same filenames locally.
-CSV_FILENAME = "review_log.csv"
-STUDY_LOG_FILENAME = "study_log.csv"
+# ─── OTHER CONFIG ─────────────────────────────────────────────────────────
+CSV_FILENAME        = "review_log.csv"
+STUDY_LOG_FILENAME  = "study_log.csv"
 RECORDS_FOLDER_NAME = "records"
 
 REVIEW_FIELDS = [
@@ -63,14 +58,22 @@ REVIEW_FIELDS = [
 ]
 LOG_FIELDS = ["topic", "review_date", "difficulty", "comment"]
 
-# Local cache directory and path to PDF.js viewer shipped alongside this script.
-LOCAL_CACHE = Path("local_records")
+LOCAL_CACHE  = Path("local_records")
 PDFJS_VIEWER = Path(__file__).parent / "pdfjs" / "web" / "viewer.html"
 
-# ─── DRIVE UPLOADER ─────────────────────────────────────────────────────
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/calendar",
+]
+
+logging.basicConfig(level=logging.INFO)
+
+
+# ─── DRIVE UPLOADER ───────────────────────────────────────────────────────
 class DriveUploader:
     def __init__(self, creds, root_folder_id):
-        raw_http = httplib2.Http()
+        self.creds = creds
+        raw_http = httplib2.Http(disable_ssl_certificate_validation=True)
         auth_http = google_auth_httplib2.AuthorizedHttp(creds, http=raw_http)
         self.drive = build("drive", "v3", http=auth_http, cache_discovery=False)
         self.root_id = root_folder_id
@@ -90,16 +93,15 @@ class DriveUploader:
         return self.drive.files().create(body=meta, fields="id").execute()["id"]
 
     def _get_or_create_file(self, name, fields, prepopulate=False):
-        # Look for an existing file in the records folder
         q = f"'{self.records_id}' in parents and name='{name}' and trashed=false"
         found = self.drive.files().list(q=q, fields="files(id)").execute().get("files", [])
         if found:
             return found[0]["id"]
 
-        # Create a fresh CSV with header (and optionally a first pass of topics)
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=fields)
         writer.writeheader()
+
         if prepopulate and name == CSV_FILENAME:
             for fld in self.list_topic_folders():
                 files_meta = []
@@ -123,19 +125,6 @@ class DriveUploader:
         newf = self.drive.files().create(body=meta, media_body=media, fields="id").execute()
         return newf["id"]
 
-    def list_topic_folders(self):
-        q = (
-            f"'{self.root_id}' in parents and "
-            "mimeType='application/vnd.google-apps.folder' and name!='records' and trashed=false"
-        )
-        files = self.drive.files().list(q=q, fields="files(id,name)").execute()
-        return files.get("files", [])
-
-    def list_files_in_folder(self, folder_id):
-        q = f"'{folder_id}' in parents and trashed=false"
-        resp = self.drive.files().list(q=q, fields="files(id,name)").execute()
-        return resp.get("files", [])
-
     def read_csv(self):
         return self._read_file(self.csv_id)
 
@@ -144,6 +133,14 @@ class DriveUploader:
 
     def read_log(self):
         return self._read_file(self.log_id)
+
+    def write_log(self, rows):
+        self._write_file(self.log_id, LOG_FIELDS, rows)
+
+    def append_log(self, entry):
+        logs = self.read_log()
+        logs.append(entry)
+        self._write_file(self.log_id, LOG_FIELDS, logs)
 
     def _read_file(self, file_id):
         req = self.drive.files().get_media(fileId=file_id)
@@ -162,12 +159,27 @@ class DriveUploader:
         filtered = [{k: v for k, v in row.items() if k in fields} for row in rows]
         writer.writerows(filtered)
         media = MediaIoBaseUpload(io.BytesIO(buf.getvalue().encode()), mimetype="text/csv")
-        self.drive.files().update(fileId=file_id, media_body=media).execute()
+        try:
+            self.drive.files().update(fileId=file_id, media_body=media).execute()
+        except ssl.SSLError:
+            # retry once on SSL errors
+            raw_http = httplib2.Http(disable_ssl_certificate_validation=True)
+            auth_http = google_auth_httplib2.AuthorizedHttp(self.creds, http=raw_http)
+            self.drive = build("drive", "v3", http=auth_http, cache_discovery=False)
+            self.drive.files().update(fileId=file_id, media_body=media).execute()
 
-    def append_log(self, entry):
-        logs = self.read_log()
-        logs.append(entry)
-        self._write_file(self.log_id, LOG_FIELDS, logs)
+    def list_topic_folders(self):
+        q = (
+            f"'{self.root_id}' in parents and "
+            "mimeType='application/vnd.google-apps.folder' and name!='records' and trashed=false"
+        )
+        resp = self.drive.files().list(q=q, fields="files(id,name)").execute()
+        return resp.get("files", [])
+
+    def list_files_in_folder(self, folder_id):
+        q = f"'{folder_id}' in parents and trashed=false"
+        resp = self.drive.files().list(q=q, fields="files(id,name)").execute()
+        return resp.get("files", [])
 
     def create_topic_folder(self, name):
         return self._get_or_create_folder(name, self.root_id)
@@ -200,6 +212,7 @@ class DriveUploader:
         except errors.HttpError as e:
             if e.resp.status != 404:
                 raise
+
 
 # ─── CALENDAR MANAGER ─────────────────────────────────────────────────────
 class CalendarManager:
@@ -252,6 +265,7 @@ class CalendarManager:
             if not token:
                 break
 
+
 # ─── THREADING ───────────────────────────────────────────────────────────
 class TaskSignals(QObject):
     finished = pyqtSignal(object)
@@ -273,6 +287,7 @@ class Worker(QRunnable):
             return
         self.signals.finished.emit(res)
 
+
 # ─── SETTINGS DIALOG ──────────────────────────────────────────────────────
 class SettingsDialog(QDialog):
     def __init__(self, files, parent=None):
@@ -291,6 +306,7 @@ class SettingsDialog(QDialog):
     def selected_index(self):
         return self.combo.currentIndex()
 
+
 # ─── DASHBOARD DIALOG ─────────────────────────────────────────────────────
 class DashboardDialog(QDialog):
     def __init__(self, stats, parent=None):
@@ -303,11 +319,6 @@ class DashboardDialog(QDialog):
         btn.rejected.connect(self.reject)
         layout.addWidget(btn)
 
-# OAuth & credential helpers
-SCOPES = [
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/calendar",
-]
 
 def get_user_credentials():
     creds = None
@@ -325,31 +336,23 @@ def get_user_credentials():
             pickle.dump(creds, token)
     return creds
 
+
 # ─── MAIN APP ─────────────────────────────────────────────────────────────
 class ReviewApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Spaced Repetition Review")
         self.resize(1200, 600)
-        # Change the QSettings namespace to your own, e.g. ("MyOrg", "MyApp")
         self.settings = QSettings("MyOrg", "MyApp")
 
-        creds = get_user_credentials()
-        self.uploader = DriveUploader(creds, SHARED_ROOT_FOLDER_ID)
+        self.connect_to_drive()
 
-        bot_creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE,
-            scopes=["https://www.googleapis.com/auth/drive"]
-        )
-        self.bot_uploader = DriveUploader(bot_creds, SHARED_ROOT_FOLDER_ID)
-
-        self.ensure_root_shared()
-        self.calendar = CalendarManager(creds, USER_EMAIL)
         self.pool = QThreadPool()
         self.full_data = []
         self.data = []
         self.logs = []
         self.sort_states = {}
+
         self.current_row = -1
         self.current_file_index = 0
 
@@ -359,6 +362,20 @@ class ReviewApp(QMainWindow):
         self._set_ui_enabled(False)
         self._restore_last_opened()
         self._load_data()
+
+    def connect_to_drive(self):
+        """Connect to Google Drive and Calendar services."""
+        # User-backed uploader (read + calendar)
+        creds = get_user_credentials()
+        self.uploader = DriveUploader(creds, SHARED_ROOT_FOLDER_ID)
+        self.calendar = CalendarManager(creds, USER_EMAIL)
+
+        # Bot-backed uploader (write only)
+        bot_creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        self.bot_uploader = DriveUploader(bot_creds, SHARED_ROOT_FOLDER_ID)
 
     def _startup_sync(self):
         # 1) get all Drive topic names
@@ -539,9 +556,15 @@ class ReviewApp(QMainWindow):
         self.uploader.write_csv(new_rows)
         self._load_data()
 
+    def ensure_connected(fn):
+        """Decorator to ensure Drive and Calendar connections are refreshed."""
+        def wrapped(self, *args, **kwargs):
+            self.connect_to_drive()
+            return fn(self, *args, **kwargs)
+        return wrapped
 
-
-    def sync_local_cache(self):
+    @ensure_connected
+    def sync_local_cache(self, *args):
         """Worker‐friendly kickoff for a full re-sync of local_records/."""
         pd = QProgressDialog("Syncing local cache…", None, 0, 0, self)
         pd.setWindowModality(Qt.WindowModality.WindowModal)
@@ -549,12 +572,56 @@ class ReviewApp(QMainWindow):
         pd.show()
 
         w = Worker(self._do_sync)
-        # When the sync finishes, close dialog AND update the CSV to match current Drive folders
         w.signals.finished.connect(lambda _: (pd.close(), self._sync_csv_with_drive()))
         w.signals.error.connect(lambda m: (
             pd.close(),
             QMessageBox.critical(self, "Sync Error", m)
         ))
+        self.pool.start(w)
+
+    @ensure_connected
+    def upload_selected(self):
+        r, _ = self._current()
+        if r is not None:
+            self.start_upload(r)
+
+    @ensure_connected
+    def mark_reviewed(self, r):
+        ent = self.data[r]
+        opts = ["Difficult", "Medium", "Easy"]
+        diff, ok = QInputDialog.getItem(self, "Reviewed", "How was this revision?", opts, editable=False)
+        if not ok:
+            return
+        comment, ok2 = QInputDialog.getText(self, "Comment", "Add a note:")
+        if not ok2:
+            comment = ""
+        today = QDate.currentDate().toString("yyyy-MM-dd")
+        entry = {"topic": ent["topic"], "review_date": today, "difficulty": diff, "comment": comment}
+        self.uploader.append_log(entry)
+        self.logs.append(entry)
+
+        last = ent.get("last_review", "")
+        if not last:
+            mapping = {"Difficult": 1, "Medium": 3, "Easy": 7}
+            nxt_days = mapping[diff]
+        else:
+            d0 = QDate.fromString(last, "yyyy-MM-dd").toPyDate()
+            d1 = datetime.strptime(today, "%Y-%m-%d").date()
+            delta = max(1, (d1 - d0).days)
+            factor = {"Difficult": 1.2, "Medium": 1.5, "Easy": 2.0}[diff]
+            nxt_days = max(1, round(delta * factor))
+        nxt_date = QDate.currentDate().addDays(nxt_days).toString("yyyy-MM-dd")
+
+        ent["last_review"] = today
+        ent["next_review"] = nxt_date
+        ent["calendar_event_id"] = ""
+
+        # Write updated last/next review straight back to Drive
+        self.uploader.write_csv(self.full_data)
+        self.populate_table()
+
+        w = Worker(self._reschedule, ent["topic"], nxt_date)
+        w.signals.finished.connect(lambda eid, e=ent: self._on_new_event(e, eid))
         self.pool.start(w)
 
     def _do_sync(self):
@@ -1034,6 +1101,17 @@ class ReviewApp(QMainWindow):
     def _done_upload(self, res, r, pd):
         pd.close()
         fid, name, link = res
+        self.bot_uploader.drive.permissions().create(
+            fileId=fid,
+            sendNotificationEmail=False,           # ← here
+            body={
+                "type": "user",
+                "role": "writer",
+                "emailAddress": USER_EMAIL
+            }
+        ).execute()
+
+
 
         # Update the topic's file list
         ent = self.data[r]
@@ -1047,57 +1125,45 @@ class ReviewApp(QMainWindow):
         self._save_bg()
         self.populate_table()
 
+
     def open_settings(self, r):
-        flist = json.loads(self.data[r].get("files") or "[]")
-        if not flist:
+        """Allow user to delete a file from Drive (as service account), purge local cache, and update the CSV."""
+        # 1) Load current files for this topic
+        files = json.loads(self.data[r].get("files") or "[]")
+        if not files:
             QMessageBox.information(self, "No Files", "No files to manage.")
             return
 
-        dlg = SettingsDialog(flist, self)
-        if dlg.exec() != QDialogButtonBox.StandardButton.Ok:
+        # 2) Show the settings dialog
+        dlg = SettingsDialog(files, self)
+        # Use the correct enum for “Accepted” in PyQt6
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        # Which file the user wants to delete:
+        # 3) Remove the chosen file from our in-memory list
         idx = dlg.selected_index()
-        to_del = flist[idx]
+        to_del = files.pop(idx)
 
-        # Show a little progress dialog while we delete
-        pd = QProgressDialog("Deleting file…", None, 0, 0, self)
-        pd.setWindowModality(Qt.WindowModality.WindowModal)
-        pd.setCancelButton(None)
-        pd.show()
+        # 4) Delete on Drive with the service‐account (owner)
+        self.pool.start(Worker(self.bot_uploader.delete_file, to_del["id"]))
 
-        def on_deleted(_):
-            pd.close()
-            # 1) Remove from our in-memory lists
-            new_list = [f for f in flist if f["id"] != to_del["id"]]
-            ent = self.data[r]
-            ent["files"] = json.dumps(new_list)
-            for e in self.full_data:
-                if e["topic"] == ent["topic"]:
-                    e.update(ent)
-                    break
-
-            # 2) Persist the cleaned-up CSV back to Drive
+        # 5) Purge the local cache copy
+        local = LOCAL_CACHE / self.data[r]["topic"] / to_del["name"]
+        if local.exists():
             try:
-                self.uploader.write_csv(self.full_data)
-            except Exception as e:
-                QMessageBox.critical(self, "CSV Write Error", str(e))
-                return
+                local.unlink()
+            except Exception as ex:
+                print(f"Warning deleting cache file {local}: {ex}")
 
-            # 3) Refresh the table & clear the PDF viewer
-            self.populate_table()
-            self.clear_pdf()
+        # 6) Update the in-memory record and persist via background save
+        ent = self.data[r]
+        ent["files"] = json.dumps(files)
+        self._save_bg()
 
-        def on_error(msg):
-            pd.close()
-            QMessageBox.critical(self, "Delete Error", msg)
+        # 7) Refresh UI
+        self.populate_table()
+        self.clear_pdf()
 
-        # Fire off the real delete, then hook in our callbacks
-        w = Worker(self.bot_uploader.delete_file, to_del["id"])
-        w.signals.finished.connect(on_deleted)
-        w.signals.error.connect(on_error)
-        self.pool.start(w)
 
     def compute_stats(self):
         total = len(self.full_data)
@@ -1122,7 +1188,17 @@ class ReviewApp(QMainWindow):
         dlg.exec()
 
     def _save_bg(self):
-        pass  # No longer needed since changes are written immediately
+        def save():
+            try:
+                self.uploader.write_csv(self.full_data)
+            except ssl.SSLError:
+                # fallback to local backup
+                bak = Path("backup_review_log.csv")
+                with bak.open("w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=REVIEW_FIELDS)
+                    w.writeheader()
+                    w.writerows(self.full_data)
+        self.pool.start(Worker(save))
 
     def add_topic(self, _=None):
         txt, ok = QInputDialog.getText(self, "New Topic", "Enter topic name:")
@@ -1131,6 +1207,17 @@ class ReviewApp(QMainWindow):
 
         # Use the bot uploader to create the folder
         fid = self.bot_uploader.create_topic_folder(txt.strip())
+
+                # Share the folder with the user account
+        self.bot_uploader.drive.permissions().create(
+            fileId=fid,
+            sendNotificationEmail=False,           # ← here
+            body={
+                "type": "user",
+                "role": "writer",
+                "emailAddress": USER_EMAIL
+            }
+        ).execute()
 
         # Add the topic to the data
         ent = {
@@ -1162,10 +1249,12 @@ class ReviewApp(QMainWindow):
             self._save_bg()
             self.populate_table()
             self.clear_pdf()
-
-        self.current_row = r
-        self.current_file_index = 0
-        self._open_file_by_index(r, 0)
+            # if there’s still a topic at index r (or the last one), open its first file
+            if self.data:
+                next_row = min(r, len(self.data) - 1)
+                self.current_row = next_row
+                self.current_file_index = 0
+                self._open_file_by_index(next_row, 0)
 
     def open_next_file(self):
         if self.current_row < 0:
@@ -1179,30 +1268,6 @@ class ReviewApp(QMainWindow):
         self.current_file_index -= 1
         self._open_file_by_index(self.current_row, self.current_file_index)
 
-    def ensure_root_shared(self):
-        drive = self.bot_uploader.drive
-        # 1) Get existing permissions on the root folder
-        try:
-            resp = drive.permissions().list(
-                fileId=SHARED_ROOT_FOLDER_ID,
-                fields="permissions(id,emailAddress)"
-            ).execute()
-            perms = resp.get("permissions", [])
-            if any(p.get("emailAddress") == USER_EMAIL for p in perms):
-                return  # Already shared
-
-            # 2) Otherwise, create the permission
-            drive.permissions().create(
-                fileId=SHARED_ROOT_FOLDER_ID,
-                body={
-                    "type": "user",
-                    "role": "writer",
-                    "emailAddress": USER_EMAIL
-                }
-            ).execute()
-        except HttpError as e:
-            # Log the error and move on
-            print("Could not share root folder:", e)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
